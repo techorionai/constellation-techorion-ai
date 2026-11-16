@@ -1,0 +1,11 @@
+The files in bifrost/local-data/ are copies of files from the Bifrost
+repository (https://github.com/maximhq/bifrost) at the tag transports/v2.5.1.
+Bifrost is licensed under the Apache License, Version 2.0.
+You can read the license at https://www.apache.org/licenses/LICENSE-2.0
+
+Source files:
+- pricing.json: framework/modelcatalog/datasheet/testdata/pricing.json
+- model-parameters.json: framework/modelcatalog/datasheet/testdata/model-parameters.json
+- servers.json: community/mcp-library/servers.json
+
+The files are not changed.

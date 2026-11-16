@@ -1,0 +1,64 @@
+{
+  "$schema": "https://www.getbifrost.ai/schema",
+  "encryption_key": "env.BIFROST_ENCRYPTION_KEY",
+  "setup_token": "env.BIFROST_SETUP_TOKEN",
+  "client": {
+    "enable_logging": true,
+    "enforce_auth_on_inference": true
+  },
+  "governance": {
+    "auth_config": {
+      "is_enabled": true,
+      "admin_username": "env.BIFROST_ADMIN_USERNAME",
+      "admin_password": "env.BIFROST_ADMIN_PASSWORD"
+    }
+  },
+  "config_store": {
+    "enabled": true,
+    "type": "postgres",
+    "config": {
+      "host": "env.BIFROST_DB_HOST",
+      "port": "env.BIFROST_DB_PORT",
+      "user": "env.BIFROST_DB_USER",
+      "password": "env.BIFROST_DB_PASSWORD",
+      "db_name": "bifrost",
+      "ssl_mode": "disable"
+    }
+  },
+  "logs_store": {
+    "enabled": true,
+    "type": "postgres",
+    "config": {
+      "host": "env.BIFROST_DB_HOST",
+      "port": "env.BIFROST_DB_PORT",
+      "user": "env.BIFROST_DB_USER",
+      "password": "env.BIFROST_DB_PASSWORD",
+      "db_name": "bifrost",
+      "ssl_mode": "disable"
+    }
+  },
+  "framework": {
+    "pricing": {
+      "pricing_url": "file:///app/local-data/pricing.json",
+      "model_parameters_url": "file:///app/local-data/model-parameters.json",
+      "mcp_library_url": "file:///app/local-data/servers.json",
+      "mcp_library_sync_interval": 0,
+      "live_models_sync_interval": 0
+    }
+  },
+  "providers": {
+    "openai": {
+      "keys": [
+        {
+          "name": "spike-openai",
+          "value": "env.BIFROST_OPENAI_API_KEY",
+          "models": ["gpt-4o"],
+          "weight": 1
+        }
+      ],
+      "network_config": {
+        "max_retries": 0
+      }
+    }
+  }
+}
