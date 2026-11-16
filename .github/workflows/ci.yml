@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    uses: techorionai/constellation-ci/.github/workflows/go.yml@v0.2.0
+    with:
+      integration-command: go test -race -tags=integration -timeout 25m ./...
+      integration-timeout-minutes: 30
