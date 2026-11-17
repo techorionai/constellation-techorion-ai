@@ -1,7 +1,8 @@
 // Package mcpserver has a real MCP server for the integration tests. It plays
 // the application side: it records the method and the headers of each JSON-RPC
 // request, and it rejects tools/call when the token is not one of the expected
-// values. It answers initialize and tools/list without a token.
+// values. It answers the other methods, for example server/discover and
+// tools/list, without a token.
 package mcpserver
 
 import (

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/moby/moby/api/types/container"
+	dnet "github.com/moby/moby/api/types/network"
 	"github.com/testcontainers/testcontainers-go"
 	tcexec "github.com/testcontainers/testcontainers-go/exec"
 	"github.com/testcontainers/testcontainers-go/network"
@@ -36,6 +37,9 @@ const (
 	HostInternal = testcontainers.HostInternal
 	// PCAPPath is the path of the capture file in the capture container.
 	PCAPPath = "/capture/run.pcap"
+	// TcpdumpErrPath is the path of the file with the messages of tcpdump. At
+	// the end of the capture it has the packet counts.
+	TcpdumpErrPath = "/capture/tcpdump.err"
 	// DatabaseName is the name of the Bifrost database and role.
 	DatabaseName = "bifrost"
 )
@@ -63,7 +67,8 @@ type Stack struct {
 	// 5432 in the capture before Bifrost started.
 	SynToPGBeforeBifrost int
 
-	cleanups []func()
+	extraSecrets []string
+	cleanups     []func()
 }
 
 // Options set the start of a stack.
@@ -73,9 +78,6 @@ type Options struct {
 	HostPorts []int
 	// ModelPort is the port of the scripted model server in HostPorts.
 	ModelPort int
-	// SkipBifrost starts the network, PostgreSQL, and the capture container
-	// only.
-	SkipBifrost bool
 }
 
 // Start starts the stack in this order: network, PostgreSQL, capture container
@@ -102,10 +104,8 @@ func Start(ctx context.Context, o Options) (*Stack, error) {
 	if err := s.startCapture(ctx); err != nil {
 		return nil, err
 	}
-	if !o.SkipBifrost {
-		if err := s.startBifrost(ctx, o); err != nil {
-			return nil, err
-		}
+	if err := s.startBifrost(ctx, o); err != nil {
+		return nil, err
 	}
 	ok = true
 	return s, nil
@@ -133,6 +133,9 @@ func (s *Stack) startPostgres(ctx context.Context) error {
 			NetworkAliases: map[string][]string{
 				s.Network.Name: {PGAlias},
 			},
+			HostConfigModifier: func(hc *container.HostConfig) {
+				publishOnLoopback(hc, "5432/tcp")
+			},
 			WaitingFor: wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(2).WithStartupTimeout(3 * time.Minute),
 		},
@@ -158,7 +161,7 @@ func (s *Stack) startPostgres(ctx context.Context) error {
 		cmd = append(cmd, "-c", q)
 	}
 	if out, err := execOK(ctx, c, cmd); err != nil {
-		return fmt.Errorf("containers: provision postgres: %w: %s", err, redact(out, s.Secrets))
+		return fmt.Errorf("containers: provision postgres: %w: %s", err, redact(out, s.Secrets, nil))
 	}
 	ip, err := containerIP(ctx, c, s.Network.Name)
 	if err != nil {
@@ -177,6 +180,18 @@ func (s *Stack) startPostgres(ctx context.Context) error {
 	return nil
 }
 
+// publishOnLoopback publishes a container port on 127.0.0.1 of the test host
+// only. The traffic of the test stack is plain text, so no other host can reach
+// it.
+func publishOnLoopback(hc *container.HostConfig, port string) {
+	if hc.PortBindings == nil {
+		hc.PortBindings = dnet.PortMap{}
+	}
+	hc.PortBindings[dnet.MustParsePort(port)] = []dnet.PortBinding{
+		{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: "0"},
+	}
+}
+
 // PGConnString returns the connection string of the Bifrost role from the test
 // host.
 func (s *Stack) PGConnString() string {
@@ -185,8 +200,10 @@ func (s *Stack) PGConnString() string {
 }
 
 func (s *Stack) startCapture(ctx context.Context) error {
+	// The filter takes all IP packets, so a packet of any protocol (for example
+	// ICMP) is in the file and the analyzer reports it.
 	script := "mkdir -p /capture; " +
-		"tcpdump -i any -nn -U -s 512 -w " + PCAPPath + " tcp or udp 2>/capture/tcpdump.err & " +
+		"tcpdump -i any -nn -U -s 512 -w " + PCAPPath + " ip or ip6 2>" + TcpdumpErrPath + " & " +
 		"wait; tail -f /dev/null"
 	req := testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
@@ -200,6 +217,7 @@ func (s *Stack) startCapture(ctx context.Context) error {
 			HostAccessPorts: s.HostPorts,
 			HostConfigModifier: func(hc *container.HostConfig) {
 				hc.CapAdd = append(hc.CapAdd, "NET_RAW", "NET_ADMIN")
+				publishOnLoopback(hc, BifrostPort)
 			},
 		},
 		Started: true,
@@ -237,7 +255,7 @@ func (s *Stack) startCapture(ctx context.Context) error {
 			}
 		}
 		if time.Now().After(deadline) {
-			errOut, _ := execOK(ctx, c, []string{"cat", "/capture/tcpdump.err"})
+			errOut, _ := execOK(ctx, c, []string{"cat", TcpdumpErrPath})
 			return fmt.Errorf("containers: tcpdump wrote no data: %s", errOut)
 		}
 		select {
@@ -258,7 +276,7 @@ func (s *Stack) startBifrost(ctx context.Context, o Options) error {
 	if err != nil {
 		return fmt.Errorf("containers: read config.json: %w", err)
 	}
-	cfg, err = withProviderURL(cfg, fmt.Sprintf("http://%s:%d", HostInternal, o.ModelPort))
+	cfg, err = testConfig(cfg, fmt.Sprintf("http://%s:%d", HostInternal, o.ModelPort))
 	if err != nil {
 		return err
 	}
@@ -321,8 +339,11 @@ func (s *Stack) startBifrost(ctx context.Context, o Options) error {
 // PGSynCount returns the number of TCP SYN packets (without ACK) to PostgreSQL
 // port 5432 in the capture file so far.
 func (s *Stack) PGSynCount(ctx context.Context) (int, error) {
+	// The shell stops with an error when tcpdump fails. A pipe from tcpdump to
+	// wc would hide the exit code of tcpdump and give a count of 0.
 	out, err := execOK(ctx, s.Capture, []string{"sh", "-c",
-		"tcpdump -nn -r " + PCAPPath + " 'tcp[tcpflags] & (tcp-syn|tcp-ack) = tcp-syn and dst port 5432' 2>/dev/null | wc -l"})
+		"out=$(tcpdump -nn -r " + PCAPPath + " 'tcp[tcpflags] & (tcp-syn|tcp-ack) = tcp-syn and dst port 5432' 2>/dev/null) || exit 1; " +
+			"printf '%s\\n' \"$out\" | grep -c . || true"})
 	if err != nil {
 		return 0, fmt.Errorf("containers: count SYN packets: %w", err)
 	}
@@ -358,7 +379,7 @@ func (s *Stack) WaitHealthy(ctx context.Context, timeout time.Duration) error {
 		select {
 		case <-ctx.Done():
 			logs, _ := s.BifrostLogs(context.Background())
-			return fmt.Errorf("containers: bifrost not healthy: %w (last: %w)\nlogs:\n%s", ctx.Err(), last, redact(tail(logs, 4000), s.Secrets))
+			return fmt.Errorf("containers: bifrost not healthy: %w (last: %w)\nlogs:\n%s", ctx.Err(), last, s.Redact(tail(logs, 4000)))
 		case <-time.After(time.Second):
 		}
 	}
@@ -448,6 +469,19 @@ func (s *Stack) StopCapture(ctx context.Context) ([]byte, error) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+	// A packet that the kernel dropped can hide a call. Fail if tcpdump dropped
+	// any packet, and fail if the count is not in the messages of tcpdump.
+	msgs, err := execOK(ctx, s.Capture, []string{"cat", TcpdumpErrPath})
+	if err != nil {
+		return nil, fmt.Errorf("containers: read tcpdump messages: %w", err)
+	}
+	dropped, err := DroppedByKernel(msgs)
+	if err != nil {
+		return nil, err
+	}
+	if dropped > 0 {
+		return nil, fmt.Errorf("containers: tcpdump: the kernel dropped %d packets, the capture is not complete", dropped)
+	}
 	r, err := s.Capture.CopyFileFromContainer(ctx, PCAPPath)
 	if err != nil {
 		return nil, fmt.Errorf("containers: copy pcap: %w", err)
@@ -487,6 +521,23 @@ func (s *Stack) RunInCaptureNamespace(ctx context.Context, script string) (strin
 	return string(b), err
 }
 
+var droppedRe = regexp.MustCompile(`(?m)^(\d+) packets? dropped by kernel`)
+
+// DroppedByKernel reads the number of packets that the kernel dropped from the
+// messages that tcpdump writes when it ends. It returns an error when the
+// messages have no such line, because then the capture can not prove anything.
+func DroppedByKernel(msgs string) (int, error) {
+	m := droppedRe.FindStringSubmatch(msgs)
+	if m == nil {
+		return 0, fmt.Errorf("containers: the tcpdump messages have no drop count: %q", tail(msgs, 300))
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, fmt.Errorf("containers: tcpdump drop count: %w", err)
+	}
+	return n, nil
+}
+
 func execOK(ctx context.Context, c testcontainers.Container, cmd []string) (string, error) {
 	code, r, err := c.Exec(ctx, cmd, tcexec.Multiplexed())
 	var out string
@@ -521,13 +572,15 @@ func containerIP(ctx context.Context, c testcontainers.Container, networkName st
 	return n.IPAddress.String(), nil
 }
 
-// withProviderURL sets providers.openai.network_config.base_url and
-// allow_private_network (the scripted model server has a private address) in the
-// configuration. The field does not accept an env. value, and the management API
-// refuses a private address, so the test writes the URL of the scripted model
-// server into the copy of config.json that goes into the container. The file in
-// the repository has no base_url.
-func withProviderURL(cfg []byte, baseURL string) ([]byte, error) {
+// testConfig makes the copy of config.json that goes into the container. It
+// sets values that are for the test only and that the file in the repository
+// does not have:
+//   - providers.openai.network_config.base_url and allow_private_network: the
+//     scripted model server has a private address. The field does not accept an
+//     env. value, and the management API refuses a private address.
+//   - ssl_mode: disable in both stores: the test network has no TLS for
+//     PostgreSQL. The file in the repository has a value with TLS.
+func testConfig(cfg []byte, baseURL string) ([]byte, error) {
 	var m map[string]any
 	if err := json.Unmarshal(cfg, &m); err != nil {
 		return nil, fmt.Errorf("containers: parse config.json: %w", err)
@@ -540,6 +593,14 @@ func withProviderURL(cfg []byte, baseURL string) ([]byte, error) {
 	}
 	nc["base_url"] = baseURL
 	nc["allow_private_network"] = true
+	for _, store := range []string{"config_store", "logs_store"} {
+		st, _ := m[store].(map[string]any)
+		sc, _ := st["config"].(map[string]any)
+		if sc == nil {
+			return nil, fmt.Errorf("containers: config.json has no %s.config", store)
+		}
+		sc["ssl_mode"] = "disable"
+	}
 	out, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("containers: encode config.json: %w", err)
@@ -566,24 +627,37 @@ func repoPath(parts ...string) string {
 	}
 }
 
-var secretLike = regexp.MustCompile(`[0-9a-f]{64}`)
-
 // redact removes the secret values of a run from a text, so the text can go
-// to a test log.
-func redact(s string, sec bifrostapi.Secrets) string {
-	for _, v := range []string{
+// to a test log. It removes only the listed values and not other hex strings,
+// so container IDs and image digests stay for debug.
+func redact(s string, sec bifrostapi.Secrets, extra []string) string {
+	vals := append([]string{
 		sec.AdminPassword, sec.SetupToken, sec.EncryptionKey, sec.PGAdminPassword,
 		sec.PGBifrostPassword, sec.OpenAIKey, sec.TokenA, sec.TokenB, sec.TokenBad,
-	} {
+	}, extra...)
+	for _, v := range vals {
 		if v != "" {
 			s = strings.ReplaceAll(s, v, "[redacted]")
 		}
 	}
-	return secretLike.ReplaceAllString(s, "[redacted]")
+	return s
 }
 
-// Redact removes the secret values of the stack from a text.
-func (s *Stack) Redact(text string) string { return redact(text, s.Secrets) }
+// RedactSecrets removes the secret values from a text. Use it when no stack
+// exists, for example when Start fails.
+func RedactSecrets(text string, sec bifrostapi.Secrets) string { return redact(text, sec, nil) }
+
+// Redact removes the secret values of the stack from a text. This includes the
+// values that AddSecret registered.
+func (s *Stack) Redact(text string) string { return redact(text, s.Secrets, s.extraSecrets) }
+
+// AddSecret registers a secret value that the test made during the run, for
+// example a virtual key, so that Redact removes it.
+func (s *Stack) AddSecret(v string) {
+	if v != "" {
+		s.extraSecrets = append(s.extraSecrets, v)
+	}
+}
 
 func tail(s string, n int) string {
 	if len(s) <= n {

@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -94,12 +95,18 @@ func serialize(t *testing.T, linkType layers.LinkType, src, dst netip.Addr, tr g
 		proto = layers.IPProtocolTCP
 	case *layers.UDP:
 		proto = layers.IPProtocolUDP
+	case *layers.ICMPv4:
+		proto = layers.IPProtocolICMPv4
+	case *layers.ICMPv6:
+		proto = layers.IPProtocolICMPv6
 	}
 	ipl, et, nl := ipLayer(src, dst, proto)
 	switch l := tr.(type) {
 	case *layers.TCP:
 		_ = l.SetNetworkLayerForChecksum(nl)
 	case *layers.UDP:
+		_ = l.SetNetworkLayerForChecksum(nl)
+	case *layers.ICMPv6:
 		_ = l.SetNetworkLayerForChecksum(nl)
 	}
 	buf := gopacket.NewSerializeBuffer()
@@ -125,6 +132,18 @@ func tcpSYN(t *testing.T, src, dst netip.Addr, dport uint16, ack bool) pkt {
 	t.Helper()
 	tcp := &layers.TCP{SrcPort: 50000, DstPort: layers.TCPPort(dport), SYN: true, ACK: ack, Window: 1000}
 	return serialize(t, layers.LinkTypeLinuxSLL, src, dst, tcp, nil)
+}
+
+func icmpEcho(t *testing.T, src, dst netip.Addr) pkt {
+	t.Helper()
+	icmp := &layers.ICMPv4{TypeCode: layers.CreateICMPv4TypeCode(layers.ICMPv4TypeEchoRequest, 0), Id: 1, Seq: 1}
+	return serialize(t, layers.LinkTypeLinuxSLL, src, dst, icmp, []byte("ping"))
+}
+
+func icmpv6(t *testing.T, src, dst netip.Addr, typ uint8) pkt {
+	t.Helper()
+	icmp := &layers.ICMPv6{TypeCode: layers.CreateICMPv6TypeCode(typ, 0)}
+	return serialize(t, layers.LinkTypeLinuxSLL, src, dst, icmp, []byte{0, 0, 0, 0})
 }
 
 func dnsQuery(t *testing.T, linkType layers.LinkType, src netip.Addr, name string) pkt {
@@ -191,6 +210,16 @@ func fixtures(t *testing.T) map[string][]byte {
 		),
 		"ipv6_syn.pcap": pcapBytes(t, sll,
 			tcpSYN(t, localV6, otherV6, 443, false),
+		),
+		"icmp_unexpected.pcap": pcapBytes(t, sll,
+			tcpSYN(t, localV4, pgV4, 5432, false),
+			icmpEcho(t, localV4, otherV4),
+			icmpv6(t, localV6, otherV6, layers.ICMPv6TypeEchoRequest),
+		),
+		"icmpv6_discovery.pcap": pcapBytes(t, sll,
+			tcpSYN(t, localV4, pgV4, 5432, false),
+			icmpv6(t, localV6, netip.MustParseAddr("ff02::1:ff00:1"), layers.ICMPv6TypeNeighborSolicitation),
+			icmpv6(t, localV6, netip.MustParseAddr("ff02::16"), 143),
 		),
 	}
 }
@@ -314,5 +343,35 @@ func TestU12IPv6(t *testing.T) {
 	want := netip.AddrPortFrom(otherV6, 443)
 	if len(res.UnexpectedPeers) != 1 || res.UnexpectedPeers[0] != want {
 		t.Fatalf("unexpected peers %v, want [%v]", res.UnexpectedPeers, want)
+	}
+}
+
+// An outbound packet that is not TCP and not UDP is reported. A capture
+// with only TCP and UDP filters would have hidden it.
+func TestOtherProtocols(t *testing.T) {
+	res, err := analyzeFile(t, "icmp_unexpected.pcap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"icmpv4 203.0.113.9", "icmpv6 2001:db8::9"}
+	if !reflect.DeepEqual(res.OtherProtocols, want) {
+		t.Errorf("OtherProtocols %v, want %v", res.OtherProtocols, want)
+	}
+	if res.OK() {
+		t.Errorf("OK is true for a capture with outbound ICMP")
+	}
+	if len(res.UnexpectedPeers) != 0 {
+		t.Errorf("an ICMP packet is in the TCP and UDP peers: %v", res.UnexpectedPeers)
+	}
+}
+
+// IPv6 neighbor discovery and multicast listener messages are not calls.
+func TestIPv6Discovery(t *testing.T) {
+	res, err := analyzeFile(t, "icmpv6_discovery.pcap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.OtherProtocols) != 0 || !res.OK() {
+		t.Errorf("result %+v, want no other protocol", res)
 	}
 }
