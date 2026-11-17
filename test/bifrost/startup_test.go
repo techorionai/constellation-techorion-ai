@@ -3,7 +3,6 @@
 package bifrost
 
 import (
-	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -18,7 +17,7 @@ import (
 // I1: start the network, PostgreSQL, the capture container, and Bifrost in the
 // capture namespace. Wait for /health.
 func (s *suite) i1Startup(t *testing.T) {
-	ctx := context.Background()
+	ctx := s.ctx
 	s.must(t, s.stack.WaitHealthy(ctx, 3*time.Minute))
 
 	// The tables of Bifrost are in the bifrost database (PostgreSQL stores).
@@ -61,17 +60,17 @@ func (s *suite) i1Startup(t *testing.T) {
 func (s *suite) i2NewsFeedSwitch(t *testing.T) {
 	put := s.admin(t, "PUT", "/api/rss/settings", map[string]any{"enabled": false})
 	if put.Status != 200 {
-		t.Fatalf("PUT /api/rss/settings: %d %s", put.Status, put.Body)
+		t.Fatalf("PUT /api/rss/settings: %d %s", put.Status, s.stack.Redact(string(put.Body)))
 	}
 	get := s.admin(t, "GET", "/api/rss/items", nil)
-	t.Logf("GET /api/rss/items: %d %s", get.Status, get.Body)
+	t.Logf("GET /api/rss/items: %d %s", get.Status, s.stack.Redact(string(get.Body)))
 	if get.Status != 200 {
-		t.Fatalf("GET /api/rss/items: %d %s", get.Status, get.Body)
+		t.Fatalf("GET /api/rss/items: %d %s", get.Status, s.stack.Redact(string(get.Body)))
 	}
 	var v any
 	s.must(t, json.Unmarshal(get.Body, &v))
 	if !emptyList(v) {
-		t.Errorf("the feed is not empty: %s", get.Body)
+		t.Errorf("the feed is not empty: %s", s.stack.Redact(string(get.Body)))
 	}
 }
 
@@ -104,18 +103,18 @@ func emptyList(v any) bool {
 func (s *suite) i3NoCredentials(t *testing.T) {
 	r := s.call(t, "GET", "/api/mcp/clients", nil, nil)
 	if r.Status != 401 {
-		t.Errorf("GET /api/mcp/clients without credentials: %d %s, want 401", r.Status, r.Body)
+		t.Errorf("GET /api/mcp/clients without credentials: %d %s, want 401", r.Status, s.stack.Redact(string(r.Body)))
 	}
 }
 
 // I18: a management call with the admin user and a wrong password.
 func (s *suite) i18WrongPassword(t *testing.T) {
-	r, err := s.api.Do(context.Background(), bifrostapi.Request{
+	r, err := s.api.Do(s.ctx, bifrostapi.Request{
 		Method: "GET", Path: "/api/mcp/clients",
 		AdminUser: s.secrets.AdminUser, AdminPass: bifrostapi.MustRandomSecret(),
 	})
 	s.must(t, err)
 	if r.Status != 401 {
-		t.Errorf("GET /api/mcp/clients with a wrong password: %d %s, want 401", r.Status, r.Body)
+		t.Errorf("GET /api/mcp/clients with a wrong password: %d %s, want 401", r.Status, s.stack.Redact(string(r.Body)))
 	}
 }

@@ -7,6 +7,7 @@ package bifrost
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strconv"
 	"testing"
@@ -21,18 +22,45 @@ import (
 // captureWait is the time that the capture runs after the last call (D12).
 // Bifrost background jobs run every 5 minutes. The environment variable
 // SPIKE_CAPTURE_WAIT_SECONDS is for a faster local run while you develop. Do
-// not use it for a real result.
+// not use it for a real result. The test fails when it is set and the
+// environment variable CI is set, so a CI run always has the full wait.
 func captureWait(t *testing.T) time.Duration {
-	if v := os.Getenv("SPIKE_CAPTURE_WAIT_SECONDS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			t.Fatalf("SPIKE_CAPTURE_WAIT_SECONDS=%q is not a number of seconds", v)
-		}
-		t.Logf("WARNING: the capture wait is %d seconds, not 6 minutes (SPIKE_CAPTURE_WAIT_SECONDS)", n)
-		return time.Duration(n) * time.Second
+	t.Helper()
+	d, warn, err := captureWaitFrom(os.Getenv("CI"), os.Getenv("SPIKE_CAPTURE_WAIT_SECONDS"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	return 6 * time.Minute
+	if warn != "" {
+		t.Log(warn)
+	}
+	return d
 }
+
+// fullCaptureWait is the wait of the I14 test without SPIKE_CAPTURE_WAIT_SECONDS.
+const fullCaptureWait = 6 * time.Minute
+
+// captureWaitFrom returns the capture wait for the values of the environment
+// variables CI and SPIKE_CAPTURE_WAIT_SECONDS.
+func captureWaitFrom(ci, v string) (d time.Duration, warning string, err error) {
+	if v == "" {
+		return fullCaptureWait, "", nil
+	}
+	if ci != "" {
+		return 0, "", fmt.Errorf("SPIKE_CAPTURE_WAIT_SECONDS is set and CI is set: a CI run must wait the full %s", fullCaptureWait)
+	}
+	n, perr := strconv.Atoi(v)
+	if perr != nil || n < 0 {
+		return 0, "", fmt.Errorf("SPIKE_CAPTURE_WAIT_SECONDS=%q is not a number of seconds", v)
+	}
+	return time.Duration(n) * time.Second, fmt.Sprintf("WARNING: the capture wait is %d seconds, not %s (SPIKE_CAPTURE_WAIT_SECONDS)", n, fullCaptureWait), nil
+}
+
+// The shared time limits of the tests fit in the 25 minute limit of go test:
+// TestBifrost 15 minutes and TestI15PositiveControl 8 minutes.
+const (
+	suiteTimeout = 15 * time.Minute
+	i15Timeout   = 8 * time.Minute
+)
 
 // clientName is the name of the MCP client. A client name has no hyphen.
 const clientName = "helpdesk_test"
@@ -45,6 +73,8 @@ const toolName = clientName + "-" + mcpserver.ToolName
 
 // suite is the shared state of the tests that use one Bifrost container set.
 type suite struct {
+	// ctx is the shared deadline of the test. It ends with the test.
+	ctx     context.Context
 	secrets bifrostapi.Secrets
 	stack   *containers.Stack
 	api     *bifrostapi.Client
@@ -75,7 +105,7 @@ func TestBifrost(t *testing.T) {
 	}
 	defer model.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), suiteTimeout)
 	defer cancel()
 	stack, err := containers.Start(ctx, containers.Options{
 		Secrets:   secrets,
@@ -83,11 +113,13 @@ func TestBifrost(t *testing.T) {
 		ModelPort: model.Port(),
 	})
 	if err != nil {
-		t.Fatalf("start the container set: %v", stack.Redact(err.Error()))
+		// The stack is nil here, so redact with the secrets of the run.
+		t.Fatalf("start the container set: %v", containers.RedactSecrets(err.Error(), secrets))
 	}
 	defer stack.Close()
 
 	s := &suite{
+		ctx:     ctx,
 		secrets: secrets,
 		stack:   stack,
 		api:     bifrostapi.New(stack.BaseURL, secrets.AdminUser, secrets.AdminPassword),
@@ -135,7 +167,7 @@ func (s *suite) must(t *testing.T, err error) {
 // admin sends a call with the admin credentials.
 func (s *suite) admin(t *testing.T, method, path string, body any) *bifrostapi.Response {
 	t.Helper()
-	r, err := s.api.Do(context.Background(), bifrostapi.Request{Method: method, Path: path, Body: body})
+	r, err := s.api.Do(s.ctx, bifrostapi.Request{Method: method, Path: path, Body: body})
 	s.must(t, err)
 	return r
 }
@@ -143,9 +175,30 @@ func (s *suite) admin(t *testing.T, method, path string, body any) *bifrostapi.R
 // call sends a call with the given headers and without admin credentials.
 func (s *suite) call(t *testing.T, method, path string, headers map[string]string, body any) *bifrostapi.Response {
 	t.Helper()
-	r, err := s.api.Do(context.Background(), bifrostapi.Request{
+	r, err := s.api.Do(s.ctx, bifrostapi.Request{
 		Method: method, Path: path, Headers: headers, Body: body, NoAdmin: true,
 	})
 	s.must(t, err)
 	return r
+}
+
+// The wait of I14 is the full wait in a CI run. A CI run that sets
+// SPIKE_CAPTURE_WAIT_SECONDS fails.
+func TestCaptureWaitFrom(t *testing.T) {
+	if d, _, err := captureWaitFrom("true", ""); err != nil || d != fullCaptureWait {
+		t.Errorf("CI set, no variable: %v, %v, want %v, nil", d, err, fullCaptureWait)
+	}
+	if d, _, err := captureWaitFrom("", ""); err != nil || d != fullCaptureWait {
+		t.Errorf("no CI, no variable: %v, %v, want %v, nil", d, err, fullCaptureWait)
+	}
+	if _, _, err := captureWaitFrom("true", "1"); err == nil {
+		t.Errorf("CI and the variable are set: want an error")
+	}
+	d, warn, err := captureWaitFrom("", "5")
+	if err != nil || d != 5*time.Second || warn == "" {
+		t.Errorf("local variable: %v, %q, %v, want 5s, a warning, nil", d, warn, err)
+	}
+	if _, _, err := captureWaitFrom("", "x"); err == nil {
+		t.Errorf("a bad number: want an error")
+	}
 }

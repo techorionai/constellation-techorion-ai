@@ -3,7 +3,6 @@
 package bifrost
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -16,8 +15,12 @@ import (
 // clientView is the part of GET /api/mcp/clients that the tests read.
 type clientView struct {
 	Clients []struct {
-		Config json.RawMessage `json:"config"`
-		Tools  []struct {
+		Config struct {
+			ClientID         string          `json:"client_id"`
+			Name             string          `json:"name"`
+			ConnectionString json.RawMessage `json:"connection_string"`
+		} `json:"config"`
+		Tools []struct {
 			Name string `json:"name"`
 		} `json:"tools"`
 	} `json:"clients"`
@@ -27,7 +30,7 @@ func (s *suite) listClients(t *testing.T) clientView {
 	t.Helper()
 	r := s.admin(t, "GET", "/api/mcp/clients", nil)
 	if r.Status != 200 {
-		t.Fatalf("GET /api/mcp/clients: %d %s", r.Status, r.Body)
+		t.Fatalf("GET /api/mcp/clients: %d %s", r.Status, s.stack.Redact(string(r.Body)))
 	}
 	var v clientView
 	s.must(t, json.Unmarshal(r.Body, &v))
@@ -41,9 +44,7 @@ func (s *suite) storedURL(t *testing.T) string {
 	if len(v.Clients) == 0 {
 		t.Fatalf("the client list is empty")
 	}
-	var cfg map[string]json.RawMessage
-	s.must(t, json.Unmarshal(v.Clients[0].Config, &cfg))
-	return string(cfg["connection_string"])
+	return string(v.Clients[0].Config.ConnectionString)
 }
 
 // I12: management behavior that VISION 12.1 depends on. PUT does not change the
@@ -55,9 +56,9 @@ func (s *suite) i12ManagementBehavior(t *testing.T) {
 	put := s.admin(t, "PUT", "/api/mcp/client/"+clientID, map[string]any{
 		"connection_string": strings.Replace(s.mcpURL(), "/mcp", "/other", 1),
 	})
-	t.Logf("RESULT I12 PUT status=%d body=%s", put.Status, put.Body)
+	t.Logf("RESULT I12 PUT status=%d body=%s", put.Status, s.stack.Redact(string(put.Body)))
 	if put.Status != 200 {
-		t.Errorf("PUT: %d %s, want 200", put.Status, put.Body)
+		t.Errorf("PUT: %d %s, want 200", put.Status, s.stack.Redact(string(put.Body)))
 	}
 	if after := s.storedURL(t); after != before {
 		t.Errorf("the stored connection string changed: %s -> %s", before, after)
@@ -67,9 +68,9 @@ func (s *suite) i12ManagementBehavior(t *testing.T) {
 	refresh := s.admin(t, "POST", "/api/mcp/client/"+clientID+"/refresh-tools", nil)
 	refreshRecs := s.mcp.Since(mark)
 	t.Logf("RESULT I12 MCP methods during refresh-tools: %v", rpcMethods(refreshRecs))
-	t.Logf("RESULT I12 refresh-tools status=%d body=%s", refresh.Status, refresh.Body)
+	t.Logf("RESULT I12 refresh-tools status=%d body=%s", refresh.Status, s.stack.Redact(string(refresh.Body)))
 	if refresh.Status != 200 {
-		t.Errorf("refresh-tools: %d %s, want 200", refresh.Status, refresh.Body)
+		t.Errorf("refresh-tools: %d %s, want 200", refresh.Status, s.stack.Redact(string(refresh.Body)))
 	} else {
 		m, err := refresh.JSON()
 		s.must(t, err)
@@ -88,14 +89,14 @@ func (s *suite) i12ManagementBehavior(t *testing.T) {
 	}
 
 	reconnect := s.admin(t, "POST", "/api/mcp/client/"+clientID+"/reconnect", nil)
-	t.Logf("RESULT I12 reconnect status=%d body=%s", reconnect.Status, reconnect.Body)
+	t.Logf("RESULT I12 reconnect status=%d body=%s", reconnect.Status, s.stack.Redact(string(reconnect.Body)))
 	if reconnect.Status != 400 {
-		t.Errorf("reconnect: %d %s, want 400", reconnect.Status, reconnect.Body)
+		t.Errorf("reconnect: %d %s, want 400", reconnect.Status, s.stack.Redact(string(reconnect.Body)))
 	}
 
 	del := s.admin(t, "DELETE", "/api/mcp/client/"+clientID, nil)
 	if del.Status != 200 {
-		t.Errorf("DELETE: %d %s, want 200", del.Status, del.Body)
+		t.Errorf("DELETE: %d %s, want 200", del.Status, s.stack.Redact(string(del.Body)))
 	}
 	if v := s.listClients(t); len(v.Clients) != 0 {
 		t.Errorf("the client list has %d clients after DELETE, want 0", len(v.Clients))
@@ -105,17 +106,14 @@ func (s *suite) i12ManagementBehavior(t *testing.T) {
 // I13: the tokens are in no container log and in no text column of the
 // bifrost database.
 func (s *suite) i13NoTokenStored(t *testing.T) {
-	ctx := context.Background()
-	tokens := map[string]string{
-		"token A":        s.secrets.TokenA,
-		"token B":        s.secrets.TokenB,
-		"rejected token": s.secrets.TokenBad,
-	}
+	ctx := s.ctx
+	names := []string{"token A", "token B", "rejected token"}
+	toks := []string{s.secrets.TokenA, s.secrets.TokenB, s.secrets.TokenBad}
 	logs, err := s.stack.BifrostLogs(ctx)
 	s.must(t, err)
-	for name, tok := range tokens {
+	for i, tok := range toks {
 		if strings.Contains(logs, tok) {
-			t.Errorf("%s is in the Bifrost container log", name)
+			t.Errorf("%s is in the Bifrost container log", names[i])
 		}
 	}
 	t.Logf("Bifrost log size: %d bytes", len(logs))
@@ -150,20 +148,25 @@ func (s *suite) i13NoTokenStored(t *testing.T) {
 		if logRows > 0 || time.Now().After(deadline) {
 			break
 		}
-		time.Sleep(2 * time.Second)
+		s.must(t, sleep(ctx, 2*time.Second))
 	}
 	t.Logf("searched %d text columns, logs table rows: %d", len(cols), logRows)
 	if logRows == 0 {
 		t.Fatalf("the logs table has no rows: the search proves nothing")
 	}
+	// One query for each column counts the rows for the three tokens.
 	for _, c := range cols {
-		q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE position($1 in %s::text) > 0`,
-			pgx.Identifier{c.table}.Sanitize(), pgx.Identifier{c.column}.Sanitize())
-		for name, tok := range tokens {
-			var n int
-			s.must(t, conn.QueryRow(ctx, q, tok).Scan(&n))
-			if n > 0 {
-				t.Errorf("%s is in %s.%s (%d rows)", name, c.table, c.column, n)
+		x := pgx.Identifier{c.column}.Sanitize() + "::text"
+		q := fmt.Sprintf(`SELECT
+			count(*) FILTER (WHERE position($1 in %[2]s) > 0),
+			count(*) FILTER (WHERE position($2 in %[2]s) > 0),
+			count(*) FILTER (WHERE position($3 in %[2]s) > 0)
+			FROM %[1]s`, pgx.Identifier{c.table}.Sanitize(), x)
+		var n [3]int
+		s.must(t, conn.QueryRow(ctx, q, toks[0], toks[1], toks[2]).Scan(&n[0], &n[1], &n[2]))
+		for i := range toks {
+			if n[i] > 0 {
+				t.Errorf("%s is in %s.%s (%d rows)", names[i], c.table, c.column, n[i])
 			}
 		}
 	}

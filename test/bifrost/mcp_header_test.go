@@ -15,27 +15,12 @@ import (
 func (s *suite) i4AddMCPClient(t *testing.T) {
 	mark := s.mcp.Mark()
 	r := s.admin(t, "POST", "/api/mcp/client", s.clientBody())
-	t.Logf("POST /api/mcp/client: %d %s", r.Status, r.Body)
+	t.Logf("POST /api/mcp/client: %d %s", r.Status, s.stack.Redact(string(r.Body)))
 	if r.Status != 200 {
-		t.Fatalf("add MCP client: %d %s", r.Status, r.Body)
+		t.Fatalf("add MCP client: %d %s", r.Status, s.stack.Redact(string(r.Body)))
 	}
 
-	list := s.admin(t, "GET", "/api/mcp/clients", nil)
-	if list.Status != 200 {
-		t.Fatalf("GET /api/mcp/clients: %d %s", list.Status, list.Body)
-	}
-	var out struct {
-		Clients []struct {
-			Config struct {
-				ClientID string `json:"client_id"`
-				Name     string `json:"name"`
-			} `json:"config"`
-			Tools []struct {
-				Name string `json:"name"`
-			} `json:"tools"`
-		} `json:"clients"`
-	}
-	s.must(t, json.Unmarshal(list.Body, &out))
+	out := s.listClients(t)
 	found := false
 	for _, c := range out.Clients {
 		if c.Config.Name != clientName {
@@ -56,7 +41,7 @@ func (s *suite) i4AddMCPClient(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("the list has no client %s: %s", clientName, list.Body)
+		t.Fatalf("the list has no client %s", clientName)
 	}
 
 	recs := s.mcp.Since(mark)
@@ -90,9 +75,9 @@ func (s *suite) i5PerCallAuthorization(t *testing.T) {
 		"x-bf-vk":       s.vkAll,
 		"Authorization": "Bearer " + s.secrets.TokenA,
 	})
-	t.Logf("tool execute: %d %s", r.Status, r.Body)
+	t.Logf("tool execute: %d %s", r.Status, s.stack.Redact(string(r.Body)))
 	if r.Status != 200 {
-		t.Fatalf("tool execute: %d %s", r.Status, r.Body)
+		t.Fatalf("tool execute: %d %s", r.Status, s.stack.Redact(string(r.Body)))
 	}
 	var msg struct {
 		Role string `json:"role"`
@@ -137,7 +122,7 @@ func (s *suite) i6SecondToken(t *testing.T) {
 		"Authorization": "Bearer " + s.secrets.TokenB,
 	})
 	if r.Status != 200 {
-		t.Fatalf("tool execute: %d %s", r.Status, r.Body)
+		t.Fatalf("tool execute: %d %s", r.Status, s.stack.Redact(string(r.Body)))
 	}
 	recs := s.mcp.Since(mark)
 	calls := toolsCalls(recs)

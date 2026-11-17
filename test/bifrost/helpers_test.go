@@ -3,10 +3,12 @@
 package bifrost
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/techorionai/constellation-techorion-ai/resources/test/bifrostapi"
 	"github.com/techorionai/constellation-techorion-ai/resources/test/containers"
@@ -81,6 +83,8 @@ func (s *suite) createVirtualKey(t *testing.T, name string, toolsToExecute []str
 	if err := json.Unmarshal(r.Body, &out); err != nil || out.VirtualKey.Value == "" {
 		t.Fatalf("create virtual key %s: the response has no virtual_key.value (status %d)", name, r.Status)
 	}
+	// Register the value, so that Redact removes it from each test log.
+	s.stack.AddSecret(out.VirtualKey.Value)
 	return out.VirtualKey.Value
 }
 
@@ -108,7 +112,7 @@ func (s *suite) chat(t *testing.T, headers map[string]string) *bifrostapi.Respon
 	return s.call(t, "POST", "/v1/chat/completions", headers, body)
 }
 
-// toolCalls returns the RPC methods of the records.
+// rpcMethods returns the RPC methods of the records.
 func rpcMethods(recs []mcpserver.Record) []string {
 	var out []string
 	for _, r := range recs {
@@ -126,6 +130,17 @@ func toolsCalls(recs []mcpserver.Record) []mcpserver.Record {
 		}
 	}
 	return out
+}
+
+// sleep waits for d or until the context ends. It returns the error of the
+// context in the second case.
+func sleep(ctx context.Context, d time.Duration) error {
+	select {
+	case <-time.After(d):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // headerDump returns all header names and values of the records as one text.

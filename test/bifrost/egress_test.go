@@ -20,12 +20,11 @@ import (
 // full capture. Bifrost made no call to a peer or a DNS name that is not in the
 // allow list.
 func (s *suite) i14Egress(t *testing.T) {
-	ctx := context.Background()
+	ctx := s.ctx
 	wait := captureWait(t)
 	t.Logf("wait %s for the background jobs of Bifrost", wait)
-	select {
-	case <-time.After(wait):
-	case <-ctx.Done():
+	if err := sleep(ctx, wait); err != nil {
+		t.Fatalf("the wait for the background jobs of Bifrost ended early: %v", err)
 	}
 
 	if !s.stack.Capture.IsRunning() {
@@ -50,6 +49,9 @@ func (s *suite) i14Egress(t *testing.T) {
 	}
 	if len(res.UnexpectedDNSNames) != 0 {
 		t.Errorf("unexpected DNS names: %v", res.UnexpectedDNSNames)
+	}
+	if len(res.OtherProtocols) != 0 {
+		t.Errorf("outbound packets that are not TCP and not UDP: %v", res.OtherProtocols)
 	}
 	// The capture must show the calls that we expect. If it does not, a pass
 	// means nothing.
@@ -77,7 +79,7 @@ func TestI15PositiveControl(t *testing.T) {
 	}
 	defer model.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), i15Timeout)
 	defer cancel()
 	stack, err := containers.Start(ctx, containers.Options{
 		Secrets:   secrets,
@@ -85,7 +87,8 @@ func TestI15PositiveControl(t *testing.T) {
 		ModelPort: model.Port(),
 	})
 	if err != nil {
-		t.Fatalf("start the container set: %v", err)
+		// The stack is nil here, so redact with the secrets of the run.
+		t.Fatalf("start the container set: %v", containers.RedactSecrets(err.Error(), secrets))
 	}
 	defer stack.Close()
 	if err := stack.WaitHealthy(ctx, 3*time.Minute); err != nil {
@@ -94,26 +97,28 @@ func TestI15PositiveControl(t *testing.T) {
 
 	out, err := stack.RunInCaptureNamespace(ctx, "nslookup getbifrost.ai; nc -z -w 3 1.1.1.1 443; true")
 	if err != nil {
+		t.Fatal(stack.Redact(err.Error()))
+	}
+	t.Logf("helper output:\n%s", stack.Redact(out))
+	if err := sleep(ctx, 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("helper output:\n%s", out)
-	time.Sleep(2 * time.Second)
 
 	pcap, err := stack.StopCapture(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal(stack.Redact(err.Error()))
 	}
 	local, err := stack.LocalAddrs(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal(stack.Redact(err.Error()))
 	}
 	allow, err := stack.Allow()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal(stack.Redact(err.Error()))
 	}
 	res, err := capture.Analyze(bytes.NewReader(pcap), local, allow)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal(stack.Redact(err.Error()))
 	}
 	t.Logf("unexpected peers: %v, unexpected DNS names: %v", res.UnexpectedPeers, res.UnexpectedDNSNames)
 	if !slices.Contains(res.UnexpectedDNSNames, "getbifrost.ai") {
