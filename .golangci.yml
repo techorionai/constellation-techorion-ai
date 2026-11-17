@@ -1,0 +1,20 @@
+version: "2"
+
+run:
+  # Lint the integration test files too.
+  build-tags:
+    - integration
+
+linters:
+  default: standard
+  enable:
+    - misspell
+    - gosec
+    - errorlint
+    - bodyclose
+    - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

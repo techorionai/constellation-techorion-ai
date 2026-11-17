@@ -1,0 +1,13 @@
+# Capture files that a test run makes. Fixtures in testdata/ are kept.
+*.pcap
+!**/testdata/*.pcap
+
+# Build output
+/bin/
+*.test
+*.out
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
